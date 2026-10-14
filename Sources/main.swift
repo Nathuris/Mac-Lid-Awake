@@ -9,6 +9,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var timer: Timer?
     private var displayEnabled = false
     private var lidEnabled = false
+    private var lockOnClose: Bool {
+        get { defaults.bool(forKey: "合盖时锁定屏幕") }
+        set { defaults.set(newValue, forKey: "合盖时锁定屏幕") }
+    }
     private var busy = false
     private var enableIssue = ""
     private var watchdogPID: pid_t?
@@ -87,7 +91,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lastClosed = closed
         if justClosed && lidEnabled {
             releaseDisplay()
-            if lockFunction?() != 0 {
+            if lockOnClose && lockFunction?() != 0 {
                 // 锁定失败时停止保持运行，避免以未锁定状态继续工作。
                 restoreSleep(quitAfter: false, lockFailure: true)
             } else {
@@ -198,7 +202,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("锁屏保持亮屏", #selector(toggleDisplay), checked: displayEnabled, enabled: !busy))
         menu.addItem(item("开盖锁屏后，锁屏界面持续亮着", nil, enabled: false))
         menu.addItem(item("合盖继续运行", #selector(toggleLid), checked: lidEnabled, enabled: !busy && !needsRecovery))
-        menu.addItem(item("合盖立即黑屏并锁定，任务继续", nil, enabled: false))
+        menu.addItem(item(lockOnClose ? "合盖立即黑屏并锁定，任务继续" : "合盖立即黑屏，任务继续", nil, enabled: false))
+        menu.addItem(item("合盖时锁定屏幕", #selector(toggleLockOnClose), checked: lockOnClose, enabled: !busy && lockFunction != nil))
         if needsRecovery {
             menu.addItem(item("恢复上次的休眠设置…", #selector(recover), enabled: !busy))
         }
@@ -224,6 +229,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         releaseDisplay()
         refreshMenu()
         if defaults.object(forKey: recoveryKey) != nil { restoreSleep(quitAfter: false) }
+    }
+
+    @objc private func toggleLockOnClose() {
+        lockOnClose.toggle()
+        refreshMenu()
     }
 
     @objc private func toggleDisplay() { displayEnabled.toggle(); tick(); refreshMenu() }
@@ -330,8 +340,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func enableLid(alsoDisplay: Bool) {
-        guard lidClosed() == false, lockFunction != nil else {
-            alert("暂时不能开启", "请先打开 Mac。程序也需要能调用系统锁屏功能，才能保证合盖时锁定。")
+        guard lidClosed() == false, !lockOnClose || lockFunction != nil else {
+            alert("暂时不能开启", "请先打开 Mac。如果开启了合盖锁屏，程序还需要能调用系统锁屏功能。")
             return
         }
         let original: Int
@@ -345,7 +355,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         let confirmation = NSAlert()
         confirmation.messageText = "开启合盖继续运行？"
-        confirmation.informativeText = "这会修改整台 Mac 的系统休眠设置，在接电源和使用电池时都禁止 Mac 休眠，也会影响手动休眠。合盖时程序会锁屏，内置屏幕正常黑掉。\n\n关闭功能或正常退出时会恢复原设置，并可能再次要求管理员授权。本次授权还会启动独立恢复进程：程序崩溃或被强制退出时，它会恢复正常休眠。突然断电等情况下，请重新打开应用检查恢复入口。持续运行会耗电、发热，请保持通风，不要放进包里。"
+        confirmation.informativeText = "这会修改整台 Mac 的系统休眠设置，在接电源和使用电池时都禁止 Mac 休眠，也会影响手动休眠。合盖时内置屏幕立即黑掉；是否主动锁屏由“合盖时锁定屏幕”开关决定。\n\n关闭功能或正常退出时会恢复原设置，并可能再次要求管理员授权。本次授权还会启动独立恢复进程：程序崩溃或被强制退出时，它会恢复正常休眠。突然断电等情况下，请重新打开应用检查恢复入口。持续运行会耗电、发热，请保持通风，不要放进包里。"
         confirmation.addButton(withTitle: "开启并授权")
         confirmation.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
@@ -410,11 +420,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showHelp() {
-        alert("点开菜单就能控制", "“开启全部功能”：同时开启锁屏亮屏与合盖运行，合盖功能需要管理员授权。\n\n两个开关也能分别使用。勾选表示已开启；菜单栏图标旁的小点表示至少一项已开启。\n\n“全部关闭，恢复正常休眠”：关闭两项功能，恢复本工具开启前的系统休眠设置，应用留在菜单栏。\n\n“恢复休眠并退出”：恢复设置后退出应用。恢复时可能需要管理员授权。\n\n合盖继续运行会耗电、发热，请保持通风。程序崩溃或被强制退出后，独立恢复进程会尝试自动恢复。突然断电或恢复进程也被强制结束时，请重新打开应用使用恢复入口。")
+        alert("点开菜单就能控制", "“开启全部功能”：同时开启锁屏亮屏与合盖运行，合盖功能需要管理员授权。\n\n两个开关也能分别使用。“合盖时锁定屏幕”默认关闭，单独记住你的选择；关闭后应用不会在合盖时主动锁屏，macOS 自身的锁定设置仍会生效。勾选表示已开启；菜单栏图标旁的小点表示至少一项已开启。\n\n“全部关闭，恢复正常休眠”：关闭两项功能，恢复本工具开启前的系统休眠设置，应用留在菜单栏。\n\n“恢复休眠并退出”：恢复设置后退出应用。恢复时可能需要管理员授权。\n\n合盖继续运行会耗电、发热，请保持通风。程序崩溃或被强制退出后，独立恢复进程会尝试自动恢复。突然断电或恢复进程也被强制结束时，请重新打开应用使用恢复入口。")
     }
 
     @objc private func showAbout() {
-        alert("合盖不休眠 · 1.0.0", "用于控制锁屏亮屏与合盖运行的菜单栏工具。\n\n锁屏保持亮屏；合盖立即黑屏、锁定，Mac 继续运行。\n\n当前版本按每次打开后主动开启功能的方式使用，不会自动开机启动。已加入本次运行的独立恢复进程；异常退出后自动恢复，重新打开时也会检查原设置。")
+        alert("合盖不休眠 · 1.0.1", "用于控制锁屏亮屏与合盖运行的菜单栏工具。\n\n锁屏保持亮屏；合盖立即黑屏，Mac 继续运行。可单独选择合盖时是否主动锁屏。\n\n当前版本按每次打开后主动开启功能的方式使用，不会自动开机启动。已加入本次运行的独立恢复进程；异常退出后自动恢复，重新打开时也会检查原设置。")
     }
 
 }
