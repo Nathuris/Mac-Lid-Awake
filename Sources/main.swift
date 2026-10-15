@@ -1,6 +1,14 @@
 import AppKit
+import IOKit
 import IOKit.pwr_mgt
 import Darwin
+
+// IOMessage.h 的 C 宏无法直接导入 Swift，以下值对应系统公开的通知编号。
+private enum PowerMessage {
+    static let canSleep: UInt32 = 0xe0000270
+    static let willSleep: UInt32 = 0xe0000280
+    static let hasPoweredOn: UInt32 = 0xe0000300
+}
 
 // 所有功能默认关闭，由用户在菜单栏主动开启。
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -18,6 +26,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var watchdogPID: pid_t?
     private var lastWatchdogCheck = Date.distantPast
     private var lastClosed = false
+    private var lidLockRequested = false
+    private var lidLockFailed = false
+    private var powerConnection: io_connect_t = 0
+    private var powerNotifier: io_object_t = 0
+    private var powerPort: IONotificationPortRef?
     private var displaySleepPending = false
     private var displaySleepFailed = false
     private var locked = false
@@ -51,8 +64,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let center = DistributedNotificationCenter.default()
         center.addObserver(self, selector: #selector(didLock), name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
         center.addObserver(self, selector: #selector(didUnlock), name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
+        registerPowerNotifications()
         refreshMenu()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
+        timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.tick() }
+        RunLoop.main.add(timer!, forMode: .common)
         if defaults.object(forKey: recoveryKey) != nil {
             if let original = defaults.object(forKey: recoveryKey) as? Int, (try? sleepValue()) == original {
                 defaults.removeObject(forKey: recoveryKey)
@@ -69,6 +84,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if lidEnabled && lidClosed() == true { turnDisplayOffAfterLock() }
     }
     @objc private func didUnlock() { locked = false; releaseDisplay() }
+
+    private func registerPowerNotifications() {
+        powerConnection = IORegisterForSystemPower(Unmanaged.passUnretained(self).toOpaque(), &powerPort, { context, _, message, argument in
+            guard let context else { return }
+            let app = Unmanaged<AppDelegate>.fromOpaque(context).takeUnretainedValue()
+            app.handlePowerMessage(message, argument: argument)
+        }, &powerNotifier)
+        if powerConnection != 0, let port = powerPort,
+           let source = IONotificationPortGetRunLoopSource(port)?.takeUnretainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+    }
+
+    private func handlePowerMessage(_ message: UInt32, argument: UnsafeMutableRawPointer?) {
+        switch message {
+        case PowerMessage.canSleep:
+            IOAllowPowerChange(powerConnection, Int(bitPattern: argument))
+        case PowerMessage.willSleep:
+            // 先请求锁屏，再确认休眠；不取消正常休眠，也不等待授权弹窗。
+            defer { IOAllowPowerChange(powerConnection, Int(bitPattern: argument)) }
+            releaseDisplay()
+            if lidClosed() == true {
+                lastClosed = true
+                requestLidLock()
+            }
+        case PowerMessage.hasPoweredOn:
+            tick()
+        default:
+            break
+        }
+    }
+
+    @discardableResult
+    private func requestLidLock() -> Bool {
+        guard lockOnClose, !lidLockRequested else { return true }
+        let succeeded = lockFunction?() == 0
+        lidLockFailed = !succeeded
+        if succeeded { lidLockRequested = true }
+        return succeeded
+    }
 
     private func tick() {
         defer { updateSummary() }
@@ -89,12 +144,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let justClosed = closed && !lastClosed
         // 先记录状态，避免锁屏通知再次处理同一次合盖。
         lastClosed = closed
-        if justClosed && lidEnabled {
+        if !closed { lidLockRequested = false }
+        if justClosed {
             releaseDisplay()
-            if lockOnClose && lockFunction?() != 0 {
+            let lockSucceeded = requestLidLock()
+            if !lockSucceeded && lidEnabled {
                 // 锁定失败时停止保持运行，避免以未锁定状态继续工作。
                 restoreSleep(quitAfter: false, lockFailure: true)
-            } else {
+            } else if lidEnabled {
                 turnDisplayOffAfterLock()
             }
         }
@@ -167,17 +224,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private var summary: String {
         if busy { return "正在等待系统授权…" }
+        if lidLockFailed && lockOnClose { return "合盖锁屏请求失败，请手动锁屏" }
+        if powerConnection == 0 && lockOnClose { return "未能监听系统休眠，合盖锁屏可能不及时" }
         if !lidEnabled && defaults.object(forKey: recoveryKey) != nil { return "需要恢复上次的休眠设置" }
         if displaySleepFailed && lidEnabled { return "立即熄屏请求失败，请反馈" }
-        if displayEnabled && lidEnabled { return "两项功能均已开启" }
-        if displayEnabled { return "仅锁屏保持亮屏已开启" }
-        if lidEnabled { return "仅合盖继续运行已开启" }
-        return "两项功能均已关闭"
+        var active: [String] = []
+        if displayEnabled { active.append("锁屏亮屏") }
+        if lidEnabled { active.append("合盖运行") }
+        if lockOnClose { active.append("合盖锁屏") }
+        return active.isEmpty ? "所有功能均已关闭" : "已开启：" + active.joined(separator: "、")
     }
 
     private func updateSummary() {
         summaryItem?.title = summary
-        let active = displayEnabled || lidEnabled
+        let active = displayEnabled || lidEnabled || lockOnClose
         statusItem.button?.title = active ? " ·" : ""
         statusItem.button?.toolTip = "合盖不休眠：\(summary)"
         statusItem.button?.setAccessibilityLabel("合盖不休眠：\(summary)")
@@ -196,14 +256,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(summaryItem!)
         menu.addItem(.separator())
         let needsRecovery = !lidEnabled && defaults.object(forKey: recoveryKey) != nil
-        menu.addItem(item("开启全部功能", #selector(enableAll), enabled: !busy && !needsRecovery && !(displayEnabled && lidEnabled)))
-        menu.addItem(item("全部关闭，恢复正常休眠", #selector(disableAll), enabled: !busy && (displayEnabled || lidEnabled || needsRecovery)))
+        menu.addItem(item("开启亮屏与合盖运行", #selector(enableAll), enabled: !busy && !needsRecovery && !(displayEnabled && lidEnabled)))
+        menu.addItem(item("全部关闭，恢复正常休眠", #selector(disableAll), enabled: !busy && (displayEnabled || lidEnabled || lockOnClose || needsRecovery)))
         menu.addItem(.separator())
         menu.addItem(item("锁屏保持亮屏", #selector(toggleDisplay), checked: displayEnabled, enabled: !busy))
         menu.addItem(item("开盖锁屏后，锁屏界面持续亮着", nil, enabled: false))
         menu.addItem(item("合盖继续运行", #selector(toggleLid), checked: lidEnabled, enabled: !busy && !needsRecovery))
         menu.addItem(item(lockOnClose ? "合盖立即黑屏并锁定，任务继续" : "合盖立即黑屏，任务继续", nil, enabled: false))
         menu.addItem(item("合盖时锁定屏幕", #selector(toggleLockOnClose), checked: lockOnClose, enabled: !busy && lockFunction != nil))
+        menu.addItem(item("独立生效，Mac 正常休眠时也锁屏", nil, enabled: false))
         if needsRecovery {
             menu.addItem(item("恢复上次的休眠设置…", #selector(recover), enabled: !busy))
         }
@@ -226,6 +287,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func disableAll() {
         guard !busy else { return }
         displayEnabled = false
+        lockOnClose = false
+        lidLockFailed = false
         releaseDisplay()
         refreshMenu()
         if defaults.object(forKey: recoveryKey) != nil { restoreSleep(quitAfter: false) }
@@ -233,6 +296,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func toggleLockOnClose() {
         lockOnClose.toggle()
+        lidLockFailed = false
         refreshMenu()
     }
 
@@ -410,6 +474,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return .terminateNow
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        timer?.invalidate()
+        if powerNotifier != 0 { IODeregisterForSystemPower(&powerNotifier) }
+        if let port = powerPort { IONotificationPortDestroy(port) }
+        if powerConnection != 0 { IOServiceClose(powerConnection) }
+    }
+
     private func alert(_ title: String, _ text: String) {
         NSApp.activate(ignoringOtherApps: true)
         let dialog = NSAlert()
@@ -420,11 +491,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showHelp() {
-        alert("点开菜单就能控制", "“开启全部功能”：同时开启锁屏亮屏与合盖运行，合盖功能需要管理员授权。\n\n两个开关也能分别使用。“合盖时锁定屏幕”默认关闭，单独记住你的选择；关闭后应用不会在合盖时主动锁屏，macOS 自身的锁定设置仍会生效。勾选表示已开启；菜单栏图标旁的小点表示至少一项已开启。\n\n“全部关闭，恢复正常休眠”：关闭两项功能，恢复本工具开启前的系统休眠设置，应用留在菜单栏。\n\n“恢复休眠并退出”：恢复设置后退出应用。恢复时可能需要管理员授权。\n\n合盖继续运行会耗电、发热，请保持通风。程序崩溃或被强制退出后，独立恢复进程会尝试自动恢复。突然断电或恢复进程也被强制结束时，请重新打开应用使用恢复入口。")
+        alert("点开菜单就能控制", "“开启亮屏与合盖运行”：同时开启锁屏亮屏与合盖运行，合盖功能需要管理员授权。\n\n三个开关可以分别使用。“合盖时锁定屏幕”独立生效，即使合盖继续运行关闭，也会在合盖时请求锁屏。“合盖时锁定屏幕”默认关闭，单独记住你的选择；关闭后应用不会在合盖时主动锁屏，macOS 自身的锁定设置仍会生效。勾选表示已开启；菜单栏图标旁的小点表示至少一项已开启。\n\n“全部关闭，恢复正常休眠”：关闭所有功能，恢复本工具开启前的系统休眠设置，应用留在菜单栏。\n\n“恢复休眠并退出”：恢复设置后退出应用。恢复时可能需要管理员授权。\n\n合盖继续运行会耗电、发热，请保持通风。程序崩溃或被强制退出后，独立恢复进程会尝试自动恢复。突然断电或恢复进程也被强制结束时，请重新打开应用使用恢复入口。")
     }
 
     @objc private func showAbout() {
-        alert("合盖不休眠 · 1.0.1", "用于控制锁屏亮屏与合盖运行的菜单栏工具。\n\n锁屏保持亮屏；合盖立即黑屏，Mac 继续运行。可单独选择合盖时是否主动锁屏。\n\n当前版本按每次打开后主动开启功能的方式使用，不会自动开机启动。已加入本次运行的独立恢复进程；异常退出后自动恢复，重新打开时也会检查原设置。")
+        alert("合盖不休眠 · 1.0.2", "用于控制锁屏亮屏与合盖运行的菜单栏工具。\n\n锁屏保持亮屏；合盖立即黑屏，Mac 继续运行。可单独选择合盖时是否主动锁屏。\n\n当前版本按每次打开后主动开启功能的方式使用，不会自动开机启动。已加入本次运行的独立恢复进程；异常退出后自动恢复，重新打开时也会检查原设置。")
     }
 
 }
