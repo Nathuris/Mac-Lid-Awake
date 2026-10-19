@@ -7,7 +7,7 @@ source = (Path(__file__).resolve().parents[1] / "Sources/main.swift").read_text(
 power = source[source.index("    private func handlePowerMessage("):source.index("    private func tick()")]
 power = power.replace("private func", "func")
 close = source[source.index("        let justClosed = closed"):source.index("        guard displayEnabled && locked")]
-constants = source[source.index("private enum PowerMessage"):source.index("// 所有功能默认关闭")]
+constants = source[source.index("private enum PowerMessage"):source.index("// 接电源规则默认开启")]
 prefix = '''import Foundation
 var events: [String] = []
 func IOAllowPowerChange(_ connection: Int, _ argument: Int) { events.append("允许休眠") }

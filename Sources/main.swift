@@ -1,6 +1,7 @@
 import AppKit
 import IOKit
 import IOKit.pwr_mgt
+import IOKit.ps
 import Darwin
 
 // IOMessage.h 的 C 宏无法直接导入 Swift，以下值对应系统公开的通知编号。
@@ -10,13 +11,31 @@ private enum PowerMessage {
     static let hasPoweredOn: UInt32 = 0xe0000300
 }
 
-// 所有功能默认关闭，由用户在菜单栏主动开启。
+// 接电源规则默认开启，首次使用仍需系统授权；其他功能由用户主动开启。
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var summaryItem: NSMenuItem?
     private var timer: Timer?
     private var displayEnabled = false
     private var lidEnabled = false
+    private var powerRulesActive = false
+    private var batteryKeepAwake = false
+    private var autoOnPower: Bool {
+        get { defaults.object(forKey: "接电源时合盖继续运行") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "接电源时合盖继续运行") }
+    }
+    private var ruleFile: URL?
+    private var watchdogLog: String?
+    private var lastRuleStatus = ""
+    private var ruleError = false
+    private var lastStatusRead = Date.distantPast
+    private var onACPower: Bool {
+        guard let info = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let type = IOPSGetProvidingPowerSourceType(info)?.takeUnretainedValue() else { return false }
+        return type as String == kIOPSACPowerValue
+    }
+    private var ruleValue: String { "\(autoOnPower ? 1 : 0)\(batteryKeepAwake ? 1 : 0)" }
+
     private var lockOnClose: Bool {
         get { defaults.bool(forKey: "合盖时锁定屏幕") }
         set { defaults.set(newValue, forKey: "合盖时锁定屏幕") }
@@ -55,8 +74,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard NSRunningApplication.runningApplications(withBundleIdentifier: Bundle.main.bundleIdentifier ?? "").count <= 1 else {
-            NSApp.terminate(nil)
-            return
+            exit(0)
         }
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.button?.image = NSImage(systemSymbolName: "laptopcomputer", accessibilityDescription: "合盖不休眠")
@@ -75,6 +93,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else {
                 alert("上次的休眠设置需要恢复", "请点击菜单中的“恢复上次的休眠设置”。完成后再开启功能。")
             }
+        }
+        if autoOnPower && defaults.object(forKey: recoveryKey) == nil {
+            DispatchQueue.main.async { self.enableLid(alsoDisplay: false) }
         }
     }
 
@@ -127,10 +148,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func tick() {
         defer { updateSummary() }
-        if lidEnabled && !busy && Date().timeIntervalSince(lastWatchdogCheck) >= 2 {
+        refreshPowerStatus()
+        if powerRulesActive && !busy && Date().timeIntervalSince(lastWatchdogCheck) >= 2 {
             lastWatchdogCheck = Date()
             if let pid = watchdogPID, kill(pid, 0) == -1 && errno == ESRCH {
                 watchdogPID = nil
+                ruleError = true
                 restoreSleep(quitAfter: false)
             }
         }
@@ -222,15 +245,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return result
     }
 
+    private func refreshPowerStatus() {
+        guard powerRulesActive, !busy, Date().timeIntervalSince(lastStatusRead) >= 0.25,
+              let log = watchdogLog, let text = try? String(contentsOfFile: log, encoding: .utf8) else { return }
+        lastStatusRead = Date()
+        if let line = text.components(separatedBy: .newlines).last(where: { $0.hasPrefix("状态：") }), line != lastRuleStatus {
+            lastRuleStatus = line
+            let wasEnabled = lidEnabled
+            lidEnabled = line == "状态：1"
+            if lidEnabled && !wasEnabled && lidClosed() == true { turnDisplayOffAfterLock() }
+            refreshMenu()
+        }
+    }
+
+    private func writeRule(_ value: String) throws {
+        guard ["00", "01", "10", "11", "stop"].contains(value), let file = ruleFile else {
+            throw NSError(domain: "电源规则未就绪", code: 1)
+        }
+        try Data(value.utf8).write(to: file, options: .atomic)
+    }
+
+    private func applyPowerRule() {
+        guard powerRulesActive else { enableLid(alsoDisplay: false); return }
+        do { try writeRule(ruleValue) }
+        catch { ruleError = true; alert("电源规则没有更新", "请恢复休眠并退出，再重新打开软件。"); }
+        refreshMenu()
+    }
+
     private var summary: String {
         if busy { return "正在等待系统授权…" }
         if lidLockFailed && lockOnClose { return "合盖锁屏请求失败，请手动锁屏" }
         if powerConnection == 0 && lockOnClose { return "未能监听系统休眠，合盖锁屏可能不及时" }
-        if !lidEnabled && defaults.object(forKey: recoveryKey) != nil { return "需要恢复上次的休眠设置" }
+        if ruleError { return "电源规则未生效，请重新授权" }
+        if !powerRulesActive && defaults.object(forKey: recoveryKey) != nil { return "需要恢复上次的休眠设置" }
         if displaySleepFailed && lidEnabled { return "立即熄屏请求失败，请反馈" }
+        if !powerRulesActive && (autoOnPower || batteryKeepAwake) { return "电源规则待授权，请点击启用" }
+        if powerRulesActive {
+            return (onACPower ? "接电源" : "使用电池") + (lidEnabled ? " · 合盖继续运行" : " · 合盖可正常休眠")
+        }
         var active: [String] = []
         if displayEnabled { active.append("锁屏亮屏") }
-        if lidEnabled { active.append("合盖运行") }
         if lockOnClose { active.append("合盖锁屏") }
         return active.isEmpty ? "所有功能均已关闭" : "已开启：" + active.joined(separator: "、")
     }
@@ -255,14 +309,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         summaryItem = item(summary, nil, enabled: false)
         menu.addItem(summaryItem!)
         menu.addItem(.separator())
-        let needsRecovery = !lidEnabled && defaults.object(forKey: recoveryKey) != nil
-        menu.addItem(item("开启亮屏与合盖运行", #selector(enableAll), enabled: !busy && !needsRecovery && !(displayEnabled && lidEnabled)))
-        menu.addItem(item("全部关闭，恢复正常休眠", #selector(disableAll), enabled: !busy && (displayEnabled || lidEnabled || lockOnClose || needsRecovery)))
+        let needsRecovery = !powerRulesActive && defaults.object(forKey: recoveryKey) != nil
+        menu.addItem(item("开启亮屏与电源规则", #selector(enableAll), enabled: !busy && !needsRecovery && !(displayEnabled && powerRulesActive)))
+        menu.addItem(item("全部关闭，恢复正常休眠", #selector(disableAll), enabled: !busy && (displayEnabled || powerRulesActive || autoOnPower || batteryKeepAwake || lockOnClose || needsRecovery)))
         menu.addItem(.separator())
         menu.addItem(item("锁屏保持亮屏", #selector(toggleDisplay), checked: displayEnabled, enabled: !busy))
         menu.addItem(item("开盖锁屏后，锁屏界面持续亮着", nil, enabled: false))
-        menu.addItem(item("合盖继续运行", #selector(toggleLid), checked: lidEnabled, enabled: !busy && !needsRecovery))
-        menu.addItem(item(lockOnClose ? "合盖立即黑屏并锁定，任务继续" : "合盖立即黑屏，任务继续", nil, enabled: false))
+        menu.addItem(item("接电源时合盖继续运行", #selector(toggleAutoPower), checked: autoOnPower, enabled: !busy && !needsRecovery))
+        menu.addItem(item("默认开启，拔掉电源后使用电池规则", nil, enabled: false))
+        menu.addItem(item("使用电池时合盖继续运行", #selector(toggleLid), checked: batteryKeepAwake, enabled: !busy && !needsRecovery))
+        menu.addItem(item("默认关闭，仅控制使用电池时的行为", nil, enabled: false))
+        if !powerRulesActive && !needsRecovery {
+            menu.addItem(item("启用电源规则…", #selector(startPowerRules), enabled: !busy))
+        }
         menu.addItem(item("合盖时锁定屏幕", #selector(toggleLockOnClose), checked: lockOnClose, enabled: !busy && lockFunction != nil))
         menu.addItem(item("独立生效，Mac 正常休眠时也锁屏", nil, enabled: false))
         if needsRecovery {
@@ -280,13 +339,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc private func enableAll() {
         guard !busy else { return }
-        if lidEnabled { displayEnabled = true; tick(); refreshMenu() }
+        autoOnPower = true
+        if powerRulesActive { displayEnabled = true; applyPowerRule(); tick(); refreshMenu() }
         else { enableLid(alsoDisplay: true) }
     }
 
     @objc private func disableAll() {
         guard !busy else { return }
         displayEnabled = false
+        autoOnPower = false
+        batteryKeepAwake = false
         lockOnClose = false
         lidLockFailed = false
         releaseDisplay()
@@ -342,100 +404,134 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshMenu()
         let parent = getpid()
         let helperURL = Bundle.main.resourceURL?.appendingPathComponent("恢复守护.sh")
-        // 在普通用户权限下读取自带脚本，授权进程不再读取 Documents 中的应用文件。
         let helperText = helperURL.flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+        let currentRule = ruleValue
+        let existingFile = ruleFile
+        let existingLog = watchdogLog
+        let existingPID = watchdogPID
         DispatchQueue.global(qos: .userInitiated).async {
             var succeeded = false
             var launchedPID: pid_t?
+            var file = existingFile
+            var logPath = existingLog
             var issue = "系统授权未完成，或启动请求没有成功。"
-            var logPath: String?
             do {
                 if value == 1 {
-                    issue = "无法读取应用自带的恢复程序。"
                     guard let helperText else { throw NSError(domain: "恢复进程缺失", code: 1) }
-                    issue = "无法读取主程序的身份信息。"
+                    let directory = FileManager.default.temporaryDirectory.appendingPathComponent("lidawake-rules-" + UUID().uuidString)
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+                    file = directory.appendingPathComponent("mode")
+                    try Data(currentRule.utf8).write(to: file!, options: .atomic)
                     let birth = try self.run("/usr/bin/env", ["LC_ALL=C", "TZ=UTC", "/bin/ps", "-p", String(parent), "-o", "lstart="]).trimmingCharacters(in: .whitespacesAndNewlines)
-                    guard !birth.isEmpty else { throw NSError(domain: "无法识别主程序", code: 1) }
-                    let launch = "/bin/sh -c " + self.shellQuote(helperText) + " lidawake " + self.shellQuote(String(parent)) + " " + self.shellQuote(birth)
-                    // 日志由授权进程创建于临时目录，只保存恢复过程的错误，不含密码。
+                    guard !birth.isEmpty else { throw NSError(domain: "主程序身份缺失", code: 1) }
+                    let launch = "/bin/sh -c " + self.shellQuote(helperText) + " lidawake " + self.shellQuote(String(parent)) + " " + self.shellQuote(birth) + " " + self.shellQuote(file!.path)
                     let command = "trap '' HUP; log=$(/usr/bin/mktemp /private/tmp/lidawake-watchdog.XXXXXXXX) || exit 1; /bin/chmod 644 \"$log\"; " + launch + " </dev/null >\"$log\" 2>&1 & printf '%s\\n%s\\n' \"$!\" \"$log\""
-                    issue = "系统授权未完成，或系统没有接受恢复进程的启动请求。"
                     let output = try self.administratorCommand(command)
                     let lines = output.components(separatedBy: .newlines).filter { !$0.isEmpty }
                     launchedPID = lines.first.flatMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
                     if lines.count > 1 { logPath = lines[1] }
-                    issue = "恢复进程已经收到启动请求，但没有完成初始化。"
-
-                    for _ in 0..<30 {
+                    issue = "恢复进程没有完成初始化。"
+                    for _ in 0..<50 {
+                        if let logPath, let log = try? String(contentsOfFile: logPath, encoding: .utf8), log.contains("电源规则已就绪") {
+                            succeeded = launchedPID != nil
+                            break
+                        }
                         if let pid = launchedPID, kill(pid, 0) == -1 && errno == ESRCH { break }
-                        if try self.sleepValue() == 1 { succeeded = launchedPID != nil; break }
                         Thread.sleep(forTimeInterval: 0.1)
                     }
+                    if !succeeded, let file { try? Data("stop".utf8).write(to: file, options: .atomic) }
                 } else {
-                    if try self.sleepValue() != value {
-                        _ = try self.administratorCommand("/usr/bin/pmset -a disablesleep 0")
+                    if let file { try Data("stop".utf8).write(to: file, options: .atomic) }
+                    // 先等规则进程退出并恢复，避免恢复后又被自动规则重新开启。
+                    if let existingPID, let logPath {
+                        for _ in 0..<50 {
+                            let log = (try? String(contentsOfFile: logPath, encoding: .utf8)) ?? ""
+                            if log.contains("原设置已恢复") || (kill(existingPID, 0) == -1 && errno == ESRCH) { break }
+                            Thread.sleep(forTimeInterval: 0.1)
+                        }
+                        let finished = ((try? String(contentsOfFile: logPath, encoding: .utf8)) ?? "").contains("原设置已恢复") || (kill(existingPID, 0) == -1 && errno == ESRCH)
+                        guard finished else { throw NSError(domain: "电源规则尚未停止", code: 1) }
                     }
+                    if try self.sleepValue() != value { _ = try self.administratorCommand("/usr/bin/pmset -a disablesleep 0") }
                     succeeded = try self.sleepValue() == value
                 }
             } catch {
-                succeeded = false
                 if error.localizedDescription.contains("-128") { issue = "管理员授权已取消。" }
             }
             if !succeeded, let logPath, logPath.hasPrefix("/private/tmp/lidawake-watchdog."),
                let log = try? String(contentsOfFile: logPath, encoding: .utf8),
-               let detail = log.components(separatedBy: .newlines).first(where: { $0.hasPrefix("恢复检查：") }) {
-                issue = detail
-            }
+               let detail = log.components(separatedBy: .newlines).first(where: { $0.hasPrefix("恢复检查：") }) { issue = detail }
             DispatchQueue.main.async {
                 self.enableIssue = issue
                 self.busy = false
-                if value == 1 { self.watchdogPID = launchedPID }
-                if value == 0 && succeeded { self.watchdogPID = nil }
+                if value == 1 {
+                    self.watchdogPID = launchedPID
+                    self.ruleFile = file
+                    self.watchdogLog = logPath
+                }
+                if value == 0 && succeeded {
+                    self.watchdogPID = nil
+                    self.powerRulesActive = false
+                    self.ruleFile = nil
+                    self.watchdogLog = nil
+                    self.lastRuleStatus = ""
+                }
                 completion(succeeded)
                 self.refreshMenu()
             }
         }
     }
 
-    @objc private func toggleLid() {
+    @objc private func toggleAutoPower() {
         guard !busy else { return }
-        if lidEnabled { restoreSleep(quitAfter: false); return }
-        enableLid(alsoDisplay: false)
+        autoOnPower.toggle()
+        if powerRulesActive || autoOnPower || batteryKeepAwake { applyPowerRule() }
+        else { refreshMenu() }
     }
 
+    @objc private func toggleLid() {
+        guard !busy else { return }
+        batteryKeepAwake.toggle()
+        if powerRulesActive || autoOnPower || batteryKeepAwake { applyPowerRule() }
+        else { refreshMenu() }
+    }
+
+    @objc private func startPowerRules() { enableLid(alsoDisplay: false) }
+
     private func enableLid(alsoDisplay: Bool) {
+        guard !busy, !powerRulesActive else { return }
         guard lidClosed() == false, !lockOnClose || lockFunction != nil else {
             alert("暂时不能开启", "请先打开 Mac。如果开启了合盖锁屏，程序还需要能调用系统锁屏功能。")
             return
         }
+        guard defaults.object(forKey: recoveryKey) == nil else { refreshMenu(); return }
         let original: Int
-        do { original = try sleepValue() } catch {
-            alert("无法读取休眠设置", "为避免改错设置，合盖功能没有开启。")
-            return
-        }
+        do { original = try sleepValue() } catch { alert("无法读取休眠设置", "电源规则没有开启。"); return }
         guard original == 0 else {
-            alert("系统已经禁止休眠", "请先恢复现有的禁止休眠设置，再使用本工具。这样关闭本工具时才能准确恢复。")
+            alert("系统已经禁止休眠", "请先恢复现有的禁止休眠设置，再启用本工具的自动规则。")
             return
         }
         let confirmation = NSAlert()
-        confirmation.messageText = "开启合盖继续运行？"
-        confirmation.informativeText = "这会修改整台 Mac 的系统休眠设置，在接电源和使用电池时都禁止 Mac 休眠，也会影响手动休眠。合盖时内置屏幕立即黑掉；是否主动锁屏由“合盖时锁定屏幕”开关决定。\n\n关闭功能或正常退出时会恢复原设置，并可能再次要求管理员授权。本次授权还会启动独立恢复进程：程序崩溃或被强制退出时，它会恢复正常休眠。突然断电等情况下，请重新打开应用检查恢复入口。持续运行会耗电、发热，请保持通风，不要放进包里。"
-        confirmation.addButton(withTitle: "开启并授权")
+        confirmation.messageText = "启用接电源与电池规则？"
+        confirmation.informativeText = "接电源时默认合盖继续运行；使用电池时由独立开关决定，默认允许正常休眠。\n\n本次授权会启动独立恢复进程，插拔电源后自动切换，不再反复询问密码。保持运行时也会阻止手动休眠。合盖是否锁屏仍由独立开关决定。\n\n全部关闭或退出时恢复原设置。程序异常退出时，恢复进程会尝试恢复。持续运行会耗电、发热，请保持通风。"
+        confirmation.addButton(withTitle: "启用并授权")
         confirmation.addButton(withTitle: "取消")
         NSApp.activate(ignoringOtherApps: true)
-        guard confirmation.runModal() == .alertFirstButtonReturn else { return }
+        guard confirmation.runModal() == .alertFirstButtonReturn else { refreshMenu(); return }
         defaults.set(original, forKey: recoveryKey)
         _ = defaults.synchronize()
         setSleep(1) { success in
             if success {
-                self.lidEnabled = true
+                self.powerRulesActive = true
+                self.ruleError = false
                 if alsoDisplay { self.displayEnabled = true }
                 self.lastClosed = false
+                self.lastStatusRead = .distantPast
                 self.tick()
-            }
-            else {
-                if (try? self.sleepValue()) == original { self.defaults.removeObject(forKey: self.recoveryKey) }
-                self.alert("合盖继续运行未开启", self.enableIssue + "\n\n如果菜单出现恢复入口，请先点击恢复。把这条提示告诉我，就能继续定位。")
+            } else {
+                self.ruleError = true
+                if self.watchdogPID == nil && (try? self.sleepValue()) == original { self.defaults.removeObject(forKey: self.recoveryKey) }
+                self.alert("电源规则未开启", self.enableIssue + "\n\n如果菜单出现恢复入口，请先点击恢复。")
             }
         }
     }
@@ -450,6 +546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         setSleep(value) { success in
             if success {
                 self.lidEnabled = false
+                self.ruleError = false
                 self.defaults.removeObject(forKey: self.recoveryKey)
                 _ = self.defaults.synchronize()
                 if lockFailure { self.alert("合盖锁屏失败", "已恢复原休眠设置，合盖继续运行已关闭。请重新打开 Mac 并手动锁屏。") }
@@ -491,11 +588,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func showHelp() {
-        alert("点开菜单就能控制", "“开启亮屏与合盖运行”：同时开启锁屏亮屏与合盖运行，合盖功能需要管理员授权。\n\n三个开关可以分别使用。“合盖时锁定屏幕”独立生效，即使合盖继续运行关闭，也会在合盖时请求锁屏。“合盖时锁定屏幕”默认关闭，单独记住你的选择；关闭后应用不会在合盖时主动锁屏，macOS 自身的锁定设置仍会生效。勾选表示已开启；菜单栏图标旁的小点表示至少一项已开启。\n\n“全部关闭，恢复正常休眠”：关闭所有功能，恢复本工具开启前的系统休眠设置，应用留在菜单栏。\n\n“恢复休眠并退出”：恢复设置后退出应用。恢复时可能需要管理员授权。\n\n合盖继续运行会耗电、发热，请保持通风。程序崩溃或被强制退出后，独立恢复进程会尝试自动恢复。突然断电或恢复进程也被强制结束时，请重新打开应用使用恢复入口。")
+        alert("按电源来源控制合盖行为", "“接电源时合盖继续运行”默认开启，并记住选择。首次打开请完成一次系统授权，之后运行期间插拔电源会自动切换。\n\n“使用电池时合盖继续运行”默认关闭，由你手动决定。关闭这个开关不会影响接电源时继续运行。\n\n锁屏亮屏与合盖锁屏仍可独立控制。“全部关闭”会关闭所有规则，并记住接电源规则关闭的选择。\n\n退出软件会恢复原来的系统设置；下次打开会按保存的接电源规则重新请求本次运行的授权。软件不会自动开机启动，也不会唤醒已经休眠的 Mac。\n\n持续运行请保持通风。突然断电等情况下，下次打开时可能需要手动恢复设置。")
     }
 
     @objc private func showAbout() {
-        alert("合盖不休眠 · 1.0.2", "用于控制锁屏亮屏与合盖运行的菜单栏工具。\n\n锁屏保持亮屏；合盖立即黑屏，Mac 继续运行。可单独选择合盖时是否主动锁屏。\n\n当前版本按每次打开后主动开启功能的方式使用，不会自动开机启动。已加入本次运行的独立恢复进程；异常退出后自动恢复，重新打开时也会检查原设置。")
+        alert("合盖不休眠 · 1.1.0", "用于控制锁屏亮屏与合盖运行的菜单栏工具。\n\n锁屏保持亮屏；合盖立即黑屏，Mac 继续运行。可单独选择合盖时是否主动锁屏。\n\n接电源规则默认开启，首次使用需要授权；使用电池时由独立开关决定。不会自动开机启动。已加入本次运行的独立恢复进程；异常退出后自动恢复，重新打开时也会检查原设置。")
     }
 
 }
